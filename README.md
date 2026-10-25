@@ -1,5 +1,8 @@
 # Il2CppInterop — patched-runtime layout support
 
+[![Release](https://img.shields.io/github/v/release/Yoshino-Loli/Il2CppInterop-Endfield)](https://github.com/Yoshino-Loli/Il2CppInterop-Endfield/releases)
+[![License: LGPL-3.0](https://img.shields.io/badge/license-LGPL--3.0-blue)](LICENSE)
+
 让 [Il2CppInterop](https://github.com/BepInEx/Il2CppInterop) 能识别「Unity 版本号没变、但内部结构体被改过」的 il2cpp 运行时。
 
 首个验证目标：《明日方舟：终末地》(Endfield) Beta —— Unity 2021.3.34f5 / metadata v29，但 `GameAssembly.dll` 里的 `Il2CppClass` 和 `Il2CppMethodInfo` 比原版多了几个字节。上游按版本号选结构体定义，于是全部错位。
@@ -7,6 +10,22 @@
 > 补丁基于上游 `f03c8f4`（`1.5.1-ci.845+f03c8f4`，即 MelonLoader 0.7.3 自带的那份）。
 
 ---
+
+## 快速安装（用现成的 DLL）
+
+不想编译就直接下编译好的：
+
+1. 到 [Releases](https://github.com/Yoshino-Loli/Il2CppInterop-Endfield/releases) 下载 `Il2CppInterop.Runtime.dll`
+2. 备份 `<Game>/MelonLoader/net6/Il2CppInterop.Runtime.dll`
+3. 覆盖它，启动游戏
+
+只替换这一个文件，其它 Il2CppInterop 组件不用动。程序集版本仍是 `1.5.1.0`，MelonLoader 的 SupportModule 不需要改。
+
+装完日志里应该出现这一行，就说明生效了：
+
+```
+[Il2CppInterop] il2cpp layout probe: Il2CppClass +2 byte(s), Il2CppMethodInfo +1 byte(s)
+```
 
 ## 症状
 
@@ -64,7 +83,7 @@ System.NullReferenceException
 
 两个结构体加了字段后对齐大小不变（`0x138` / `0x58`），vtable 位置和分配大小都不受影响。
 
-## 用法
+## 从源码编译
 
 ```bash
 git clone https://github.com/BepInEx/Il2CppInterop.git
