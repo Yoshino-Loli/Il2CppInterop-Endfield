@@ -1,0 +1,609 @@
+diff --git a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+index 9bd9b0d..801a099 100644
+--- a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
++++ b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+@@ -189,6 +189,9 @@ namespace Il2CppInterop.Runtime.Injection
+                 .Select(s => MemoryUtils.FindSignatureInModule(Il2CppModule, s))
+                 .FirstOrDefault(p => p != 0);
+ 
++            if (pClassInit == 0)
++                pClassInit = FindClassInitFromExport();
++
+             if (pClassInit == 0)
+             {
+                 Logger.Instance.LogWarning("Class::Init signatures have been exhausted, using a substitute!");
+@@ -199,6 +202,47 @@ namespace Il2CppInterop.Runtime.Injection
+ 
+             return Marshal.GetDelegateForFunctionPointer<d_ClassInit>(pClassInit);
+         }
++
++        /// <summary>
++        /// In every il2cpp build <c>il2cpp_class_has_references</c> is
++        /// <c>if (!klass->size_inited) Class::Init(klass); return klass->has_references;</c>,
++        /// so the first call inside that export is Class::Init. The byte signatures above only
++        /// match the exact instruction sequences of the builds they were written against; a
++        /// runtime that was recompiled or patched changes the surrounding instructions while the
++        /// call itself stays. This anchors on the export instead of on code shape.
++        /// </summary>
++        private static nint FindClassInitFromExport()
++        {
++            if (!TryGetIl2CppExport(nameof(IL2CPP.il2cpp_class_has_references), out var exportAddress) ||
++                exportAddress == IntPtr.Zero)
++                return 0;
++
++            var moduleStart = Il2CppModule.BaseAddress.ToInt64();
++            var moduleEnd = moduleStart + Il2CppModule.ModuleMemorySize;
++            var code = (byte*)exportAddress;
++
++            // The call sits within the first handful of instructions; don't wander into the next function.
++            for (var offset = 0; offset < 0x60; offset++)
++            {
++                if (code[offset] != 0xE8) continue; // call rel32
++                var target = exportAddress.ToInt64() + offset + 5 + *(int*)(code + offset + 1);
++                if (target <= moduleStart || target >= moduleEnd) continue;
++                if (!LooksLikeFunctionStart((byte*)target)) continue;
++
++                Logger.Instance.LogTrace("Class::Init resolved from il2cpp_class_has_references: 0x{Address}",
++                    target.ToString("X2"));
++                return (nint)target;
++            }
++
++            return 0;
++        }
++
++        private static bool LooksLikeFunctionStart(byte* code)
++        {
++            // il2cpp prologues start with a push (0x40/0x48 REX-prefixed push, 0x53 push rbx,
++            // 0x55 push rbp, 0x56/0x57 push rsi/rdi) or a REX.W mov.
++            return code[0] is 0x40 or 0x48 or 0x53 or 0x55 or 0x56 or 0x57;
++        }
+         #endregion
+     }
+ }
+diff --git a/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs b/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs
+new file mode 100644
+index 0000000..fe504cf
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/LayoutProbe.cs
+@@ -0,0 +1,135 @@
++using System;
++using System.Runtime.InteropServices;
++using Il2CppInterop.Common;
++using Microsoft.Extensions.Logging;
++
++namespace Il2CppInterop.Runtime.Runtime;
++
++/// <summary>
++/// Some games ship an il2cpp runtime that is patched relative to stock Unity while still reporting
++/// a stock Unity version. Il2CppInterop picks its struct handlers from that reported version, so a
++/// fork silently gets the wrong layout and every field past the insertion point reads garbage.
++///
++/// This probe measures the real layout of the running module instead of trusting the version
++/// string: it asks the engine for a class/method through the il2cpp exports (which always use the
++/// true offsets) and compares the answer with what the stock struct offsets yield.
++///
++/// Layouts confirmed against Endfield (明日方舟：终末地) GameAssembly.dll, build 2025-11-25:
++///   Il2CppClass      - two extra bytes after `token`      (method_count 0x11C -> 0x11E)
++///   Il2CppMethodInfo - one extra byte after `slot`        (parameters_count 0x52 -> 0x53)
++/// </summary>
++internal static class Il2CppLayoutProbe
++{
++    private const int StockClassMethodCountOffset = 0x11C;
++    private const int StockMethodInfoParametersCountOffset = 0x52;
++
++    private static bool s_ran;
++
++    /// <summary>Extra bytes between `token` and `method_count` in <c>Il2CppClass</c>.</summary>
++    public static int ClassStructPadding { get; private set; }
++
++    /// <summary>Extra bytes between `slot` and `parameters_count` in <c>Il2CppMethodInfo</c>.</summary>
++    public static int MethodInfoStructPadding { get; private set; }
++
++    public static void Run()
++    {
++        if (s_ran) return;
++        s_ran = true;
++
++        try
++        {
++            var klass = FindProbeClass();
++            if (klass == IntPtr.Zero)
++            {
++                Logger.Instance.LogWarning("il2cpp layout probe: no probe class found, assuming stock layout");
++                return;
++            }
++
++            ProbeClassLayout(klass);
++            ProbeMethodInfoLayout(klass);
++
++            Logger.Instance.LogInformation("il2cpp layout probe: Il2CppClass +{ClassPad} byte(s), Il2CppMethodInfo +{MethodPad} byte(s)",
++                ClassStructPadding, MethodInfoStructPadding);
++        }
++        catch (Exception ex)
++        {
++            Logger.Instance.LogWarning("il2cpp layout probe failed, assuming stock layout: {Message}", ex.Message);
++        }
++    }
++
++    private static IntPtr FindProbeClass()
++    {
++        var corlib = IL2CPP.il2cpp_get_corlib();
++        if (corlib == IntPtr.Zero) return IntPtr.Zero;
++
++        string[] candidates = { "String", "Object", "Exception", "Int32" };
++        foreach (var name in candidates)
++        {
++            var klass = IL2CPP.il2cpp_class_from_name(corlib, "System", name);
++            if (klass != IntPtr.Zero) return klass;
++        }
++
++        return IntPtr.Zero;
++    }
++
++    private static void ProbeClassLayout(IntPtr klass)
++    {
++        var counted = CountMethods(klass);
++        if (counted <= 0) return;
++
++        var atStock = ReadUInt16(klass + StockClassMethodCountOffset);
++        var atShifted = ReadUInt16(klass + StockClassMethodCountOffset + 2);
++
++        if (atStock == counted) ClassStructPadding = 0;
++        else if (atShifted == counted) ClassStructPadding = 2;
++        else
++            Logger.Instance.LogWarning(
++                "il2cpp layout probe: neither 0x{Stock:X} nor 0x{Shifted:X} matches the engine's method count {Count}",
++                atStock, atShifted, counted);
++    }
++
++    private static void ProbeMethodInfoLayout(IntPtr klass)
++    {
++        int stockVotes = 0, shiftedVotes = 0;
++        var iter = IntPtr.Zero;
++
++        for (var i = 0; i < 400; i++)
++        {
++            var method = IL2CPP.il2cpp_class_get_methods(klass, ref iter);
++            if (method == IntPtr.Zero) break;
++
++            var paramCount = (int)IL2CPP.il2cpp_method_get_param_count(method);
++            if (paramCount == 0 || paramCount > 32) continue; // 0 is ambiguous often enough to skip
++
++            if (ReadByte(method + StockMethodInfoParametersCountOffset) == paramCount) stockVotes++;
++            if (ReadByte(method + StockMethodInfoParametersCountOffset + 1) == paramCount) shiftedVotes++;
++        }
++
++        if (stockVotes == 0 && shiftedVotes == 0) return;
++
++        MethodInfoStructPadding = shiftedVotes > stockVotes ? 1 : 0;
++
++        if (shiftedVotes == stockVotes)
++            Logger.Instance.LogWarning(
++                "il2cpp layout probe: ambiguous Il2CppMethodInfo layout (stock={Stock} shifted={Shifted})",
++                stockVotes, shiftedVotes);
++    }
++
++    private static int CountMethods(IntPtr klass)
++    {
++        var count = 0;
++        var iter = IntPtr.Zero;
++        while (true)
++        {
++            var method = IL2CPP.il2cpp_class_get_methods(klass, ref iter);
++            if (method == IntPtr.Zero) break;
++            if (++count > 10000) break;
++        }
++
++        return count;
++    }
++
++    private static ushort ReadUInt16(IntPtr address) => unchecked((ushort)Marshal.ReadInt16(address));
++
++    private static byte ReadByte(IntPtr address) => Marshal.ReadByte(address);
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs b/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
+index 0e4e1f7..c77d99d 100644
+--- a/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
++++ b/Il2CppInterop.Runtime/Runtime/UnityVersionHandler.cs
+@@ -112,6 +112,38 @@ public static class UnityVersionHandler
+         parameterInfoStructHandler = GetHandler<INativeParameterInfoStructHandler>();
+         propertyInfoStructHandler = GetHandler<INativePropertyInfoStructHandler>();
+         typeStructHandler = GetHandler<INativeTypeStructHandler>();
++
++        ApplyDetectedLayoutOverrides();
++    }
++
++    /// <summary>
++    /// Games that ship a patched il2cpp keep the stock Unity version string, so the version-keyed
++    /// handler selection above cannot tell them apart. Probe the live module and swap in the
++    /// matching layout when the runtime has extra fields the stock structs do not model.
++    /// </summary>
++    private static void ApplyDetectedLayoutOverrides()
++    {
++        Il2CppLayoutProbe.Run();
++
++        if (Il2CppLayoutProbe.ClassStructPadding != 0)
++        {
++            if (classStructHandler is NativeClassStructHandler_29_0)
++                classStructHandler = new NativeClassStructHandler_29_0_Padded();
++            else
++                Logger.Instance.LogWarning(
++                    "Detected a padded Il2CppClass layout, but the selected handler is {Handler}; no padded variant exists for it",
++                    classStructHandler.GetType().Name);
++        }
++
++        if (Il2CppLayoutProbe.MethodInfoStructPadding != 0)
++        {
++            if (methodInfoStructHandler is NativeMethodInfoStructHandler_29_0)
++                methodInfoStructHandler = new NativeMethodInfoStructHandler_29_0_Padded();
++            else
++                Logger.Instance.LogWarning(
++                    "Detected a padded Il2CppMethodInfo layout, but the selected handler is {Handler}; no padded variant exists for it",
++                    methodInfoStructHandler.GetType().Name);
++        }
+     }
+ 
+     private static T GetHandler<T>()
+diff --git a/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs
+new file mode 100644
+index 0000000..7afe4b6
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_29_0_Padded.cs
+@@ -0,0 +1,237 @@
++using System;
++using System.Runtime.InteropServices;
++using Il2CppInterop.Runtime.Runtime.VersionSpecific.Type;
++
++namespace Il2CppInterop.Runtime.Runtime.VersionSpecific.Class
++{
++    /// <summary>
++    /// 2021.2+ (metadata v29) <see cref="Il2CppClass"/> layout for runtimes that carry an extra
++    /// 16-bit field between <c>token</c> and <c>method_count</c>.
++    ///
++    /// Stock Unity puts <c>method_count</c> at 0x11C and <c>typeHierarchyDepth</c> at 0x12C.
++    /// Some shipped runtimes (verified against Endfield / 明日方舟：终末地, GameAssembly.dll build
++    /// 2025-11-25) keep every field up to and including <c>token</c> in place but insert two bytes
++    /// right after it, so every following member moves down by two:
++    ///
++    ///   il2cpp_class_is_subclass_of  -> movzx eax, byte ptr [rcx+0x12E]   (typeHierarchyDepth)
++    ///   il2cpp_class_has_references  -> test byte ptr [rcx+0x135], 1      (size_inited)
++    ///   il2cpp_class_get_flags       -> mov eax, dword ptr [rcx+0x114]    (flags, unchanged)
++    ///
++    /// Nothing selects this handler through <see cref="ApplicableToUnityVersionsSinceAttribute"/>:
++    /// the reported Unity version is the stock one, so <see cref="UnityVersionHandler"/> probes the
++    /// live module and swaps this handler in when the padding is present. The struct is still
++    /// 0x138 bytes because the trailing bitfields keep it 8-byte aligned, so vtable placement and
++    /// allocation sizes are unchanged.
++    /// </summary>
++    public unsafe class NativeClassStructHandler_29_0_Padded : INativeClassStructHandler
++    {
++        public int Size() => sizeof(Il2CppClass_29_0_Padded);
++
++        public INativeClassStruct CreateNewStruct(int vTableSlots)
++        {
++            IntPtr ptr = Marshal.AllocHGlobal(Size() + sizeof(VirtualInvokeData) * vTableSlots);
++            Il2CppClass_29_0_Padded* _ = (Il2CppClass_29_0_Padded*)ptr;
++            *_ = default;
++            return new NativeStructWrapper(ptr);
++        }
++
++        public INativeClassStruct Wrap(Il2CppClass* ptr)
++        {
++            if (ptr == null) return null;
++            return new NativeStructWrapper((IntPtr)ptr);
++        }
++
++        internal unsafe struct Il2CppClass_29_0_Padded
++        {
++            public Il2CppImage* image;
++            public void* gc_desc;
++            public byte* name;
++            public byte* namespaze;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 byval_arg;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 this_arg;
++            public Il2CppClass* element_class;
++            public Il2CppClass* castClass;
++            public Il2CppClass* declaringType;
++            public Il2CppClass* parent;
++            public void* generic_class;
++            public Il2CppMetadataTypeHandle typeMetadataHandle;
++            public void* interopData;
++            public Il2CppClass* klass;
++            public Il2CppFieldInfo* fields;
++            public Il2CppEventInfo* events;
++            public Il2CppPropertyInfo* properties;
++            public Il2CppMethodInfo** methods;
++            public Il2CppClass** nestedTypes;
++            public Il2CppClass** implementedInterfaces;
++            public Il2CppRuntimeInterfaceOffsetPair* interfaceOffsets;
++            public void* static_fields;
++            public void* rgctx_data;
++            public Il2CppClass** typeHierarchy;
++            public void* unity_user_data;
++            public uint initializationExceptionGCHandle;
++            public uint cctor_started;
++            public uint cctor_finished_or_no_cctor;
++            public IntPtr cctor_thread;
++            public Il2CppMetadataGenericContainerHandle genericContainerHandle;
++            public uint instance_size;
++            public uint actualSize;
++            public uint element_size;
++            public int native_size;
++            public uint static_fields_size;
++            public uint thread_static_fields_size;
++            public int thread_static_fields_offset;
++            public uint flags;
++            public uint token;
++            // The two bytes that stock Unity does not have.
++            public ushort extra_field_after_token;
++            public ushort method_count;
++            public ushort property_count;
++            public ushort field_count;
++            public ushort event_count;
++            public ushort nested_type_count;
++            public ushort vtable_count;
++            public ushort interfaces_count;
++            public ushort interface_offsets_count;
++            public byte typeHierarchyDepth;
++            public byte genericRecursionDepth;
++            public byte rank;
++            public byte minimumAlignment;
++            public byte naturalAligment;
++            public byte packingSize;
++            public Bitfield0 _bitfield0;
++            public Bitfield1 _bitfield1;
++            // Stock Unity stops after _bitfield1; this runtime reads a third bitfield byte at 0x136.
++            public byte _bitfield2;
++
++            internal enum Bitfield0 : byte
++            {
++                BIT_initialized_and_no_error = 0,
++                initialized_and_no_error = (1 << BIT_initialized_and_no_error),
++                BIT_initialized = 1,
++                initialized = (1 << BIT_initialized),
++                BIT_enumtype = 2,
++                enumtype = (1 << BIT_enumtype),
++                BIT_nullabletype = 3,
++                nullabletype = (1 << BIT_nullabletype),
++                BIT_is_generic = 4,
++                is_generic = (1 << BIT_is_generic),
++                BIT_has_references = 5,
++                has_references = (1 << BIT_has_references),
++                BIT_init_pending = 6,
++                init_pending = (1 << BIT_init_pending),
++                BIT_size_init_pending = 7,
++                size_init_pending = (1 << BIT_size_init_pending),
++            }
++
++            internal enum Bitfield1 : byte
++            {
++                BIT_size_inited = 0,
++                size_inited = (1 << BIT_size_inited),
++                BIT_has_finalize = 1,
++                has_finalize = (1 << BIT_has_finalize),
++                BIT_has_cctor = 2,
++                has_cctor = (1 << BIT_has_cctor),
++                BIT_is_blittable = 3,
++                is_blittable = (1 << BIT_is_blittable),
++                BIT_is_import_or_windows_runtime = 4,
++                is_import_or_windows_runtime = (1 << BIT_is_import_or_windows_runtime),
++                BIT_is_vtable_initialized = 5,
++                is_vtable_initialized = (1 << BIT_is_vtable_initialized),
++                BIT_is_byref_like = 6,
++                is_byref_like = (1 << BIT_is_byref_like),
++            }
++        }
++
++        internal class NativeStructWrapper : INativeClassStruct
++        {
++            public NativeStructWrapper(IntPtr ptr) => Pointer = ptr;
++
++            private static readonly int _bitfield0offset = Marshal.OffsetOf<Il2CppClass_29_0_Padded>(nameof(Il2CppClass_29_0_Padded._bitfield0)).ToInt32();
++            private static readonly int _bitfield1offset = Marshal.OffsetOf<Il2CppClass_29_0_Padded>(nameof(Il2CppClass_29_0_Padded._bitfield1)).ToInt32();
++
++            public IntPtr Pointer { get; }
++            private Il2CppClass_29_0_Padded* _ => (Il2CppClass_29_0_Padded*)Pointer;
++            public IntPtr VTable => IntPtr.Add(Pointer, sizeof(Il2CppClass_29_0_Padded));
++            public Il2CppClass* ClassPointer => (Il2CppClass*)Pointer;
++            public INativeTypeStruct ByValArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->byval_arg);
++            public INativeTypeStruct ThisArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->this_arg);
++            public ref uint InstanceSize => ref _->instance_size;
++            public ref ushort VtableCount => ref _->vtable_count;
++            public ref ushort InterfaceCount => ref _->interfaces_count;
++            public ref ushort InterfaceOffsetsCount => ref _->interface_offsets_count;
++            public ref byte TypeHierarchyDepth => ref _->typeHierarchyDepth;
++            public ref int NativeSize => ref _->native_size;
++            public ref uint ActualSize => ref _->actualSize;
++            public ref ushort MethodCount => ref _->method_count;
++            public ref ushort FieldCount => ref _->field_count;
++            public ref Il2CppClassAttributes Flags => ref *(Il2CppClassAttributes*)&_->flags;
++            public ref IntPtr Name => ref *(IntPtr*)&_->name;
++            public ref IntPtr Namespace => ref *(IntPtr*)&_->namespaze;
++            public ref Il2CppImage* Image => ref _->image;
++            public ref Il2CppClass* Parent => ref _->parent;
++            public ref Il2CppClass* ElementClass => ref _->element_class;
++            public ref Il2CppClass* CastClass => ref _->castClass;
++            public ref Il2CppClass* DeclaringType => ref _->declaringType;
++            public ref Il2CppClass* Class => ref _->klass;
++            public ref Il2CppFieldInfo* Fields => ref _->fields;
++            public ref Il2CppMethodInfo** Methods => ref _->methods;
++            public ref Il2CppClass** ImplementedInterfaces => ref _->implementedInterfaces;
++            public ref Il2CppRuntimeInterfaceOffsetPair* InterfaceOffsets => ref _->interfaceOffsets;
++            public ref Il2CppClass** TypeHierarchy => ref _->typeHierarchy;
++
++            public bool ValueType
++            {
++                get => ByValArg.ValueType && ThisArg.ValueType;
++                set { }
++            }
++
++            public bool Initialized
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized, value);
++            }
++
++            public bool EnumType
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_enumtype);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_enumtype, value);
++            }
++
++            public bool IsGeneric
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_is_generic);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_is_generic, value);
++            }
++
++            public bool HasReferences
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_has_references);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_has_references, value);
++            }
++
++            public bool SizeInited
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_size_inited);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_size_inited, value);
++            }
++
++            public bool HasFinalize
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_has_finalize);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_has_finalize, value);
++            }
++
++            public bool IsVtableInitialized
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_is_vtable_initialized);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_29_0_Padded.Bitfield1.BIT_is_vtable_initialized, value);
++            }
++
++            public bool InitializedAndNoError
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized_and_no_error);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_29_0_Padded.Bitfield0.BIT_initialized_and_no_error, value);
++            }
++        }
++    }
++}
+diff --git a/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs b/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs
+new file mode 100644
+index 0000000..6471b54
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/VersionSpecific/MethodInfo/MethodInfo_29_0_Padded.cs
+@@ -0,0 +1,114 @@
++using System;
++using System.Runtime.InteropServices;
++namespace Il2CppInterop.Runtime.Runtime.VersionSpecific.MethodInfo
++{
++    /// <summary>
++    /// 2021.2+ (metadata v29) <see cref="Il2CppMethodInfo"/> layout for runtimes that carry an
++    /// extra byte between <c>slot</c> and <c>parameters_count</c>.
++    ///
++    /// Stock Unity puts <c>parameters_count</c> at 0x52 and the bitfield at 0x53; the shipped
++    /// Endfield runtime puts them at 0x53 / 0x54, as read straight out of GameAssembly.dll:
++    ///
++    ///   il2cpp_method_get_param_count -> movzx eax, byte ptr [rcx+0x53]
++    ///   il2cpp_method_is_generic      -> movzx eax, byte ptr [rcx+0x54]; and al, 1
++    ///   il2cpp_method_get_token       -> mov eax, dword ptr [rcx+0x48]   (unchanged)
++    ///
++    /// Everything up to and including <c>slot</c> is identical to stock, and the struct still
++    /// rounds up to 0x58 bytes, so allocation sizes are unchanged.
++    /// Selected by <see cref="UnityVersionHandler"/> after probing the live module, not through
++    /// <see cref="ApplicableToUnityVersionsSinceAttribute"/>.
++    /// </summary>
++    public unsafe class NativeMethodInfoStructHandler_29_0_Padded : INativeMethodInfoStructHandler
++    {
++        public int Size() => sizeof(Il2CppMethodInfo_29_0_Padded);
++
++        public INativeMethodInfoStruct CreateNewStruct()
++        {
++            IntPtr ptr = Marshal.AllocHGlobal(Size());
++            Il2CppMethodInfo_29_0_Padded* _ = (Il2CppMethodInfo_29_0_Padded*)ptr;
++            *_ = default;
++            return new NativeStructWrapper(ptr);
++        }
++
++        public INativeMethodInfoStruct Wrap(Il2CppMethodInfo* ptr)
++        {
++            if (ptr == null) return null;
++            return new NativeStructWrapper((IntPtr)ptr);
++        }
++
++        internal unsafe struct Il2CppMethodInfo_29_0_Padded
++        {
++            public void* methodPointer;
++            public void* virtualMethodPointer;
++            public void* invoker_method;
++            public byte* name;
++            public Il2CppClass* klass;
++            public Il2CppTypeStruct* return_type;
++            public Il2CppTypeStruct** parameters;
++            public void* runtime_data;
++            public void* generic_data;
++            public uint token;
++            public ushort flags;
++            public ushort iflags;
++            public ushort slot;
++            // The byte that stock Unity does not have.
++            public byte extra_field_after_slot;
++            public byte parameters_count;
++            public Bitfield0 _bitfield0;
++
++            internal enum Bitfield0 : byte
++            {
++                BIT_is_generic = 0,
++                is_generic = (1 << BIT_is_generic),
++                BIT_is_inflated = 1,
++                is_inflated = (1 << BIT_is_inflated),
++                BIT_wrapper_type = 2,
++                wrapper_type = (1 << BIT_wrapper_type),
++                BIT_has_full_generic_sharing_signature = 3,
++                has_full_generic_sharing_signature = (1 << BIT_has_full_generic_sharing_signature),
++                BIT_indirect_call_via_invokers = 4,
++                indirect_call_via_invokers = (1 << BIT_indirect_call_via_invokers),
++            }
++        }
++
++        internal class NativeStructWrapper : INativeMethodInfoStruct
++        {
++            public NativeStructWrapper(IntPtr ptr) => Pointer = ptr;
++
++            private static readonly int _bitfield0offset = Marshal.OffsetOf<Il2CppMethodInfo_29_0_Padded>(nameof(Il2CppMethodInfo_29_0_Padded._bitfield0)).ToInt32();
++
++            public IntPtr Pointer { get; }
++            private Il2CppMethodInfo_29_0_Padded* _ => (Il2CppMethodInfo_29_0_Padded*)Pointer;
++            public Il2CppMethodInfo* MethodInfoPointer => (Il2CppMethodInfo*)Pointer;
++            public ref IntPtr Name => ref *(IntPtr*)&_->name;
++            public ref ushort Slot => ref _->slot;
++            public ref IntPtr MethodPointer => ref *(IntPtr*)&_->methodPointer;
++            public ref IntPtr VirtualMethodPointer => ref *(IntPtr*)&_->virtualMethodPointer;
++            public ref Il2CppClass* Class => ref _->klass;
++            public ref IntPtr InvokerMethod => ref *(IntPtr*)&_->invoker_method;
++            public ref Il2CppTypeStruct* ReturnType => ref _->return_type;
++            public ref Il2CppMethodFlags Flags => ref *(Il2CppMethodFlags*)&_->flags;
++            public ref byte ParametersCount => ref _->parameters_count;
++            public ref Il2CppParameterInfo* Parameters => ref *(Il2CppParameterInfo**)&_->parameters;
++            public ref uint Token => ref _->token;
++
++            public bool IsGeneric
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_generic);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_generic, value);
++            }
++
++            public bool IsInflated
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_inflated);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppMethodInfo_29_0_Padded.Bitfield0.BIT_is_inflated, value);
++            }
++
++            public bool IsMarshalledFromNative
++            {
++                get => false;
++                set { }
++            }
++        }
++    }
++}
